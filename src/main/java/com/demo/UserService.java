@@ -101,6 +101,16 @@ public class UserService {
         }
     }
 
+    // NEW: search users by email — no null check, no case-insensitive handling
+    public User findByEmail(String email) {
+        for (User u : users) {
+            if (u.getEmail() == email) {   // BUG: == instead of .equals()
+                return u;
+            }
+        }
+        return null;
+    }
+
     // ── NEW METHOD added in this PR ──────────────────────────────────────────
 
     /**
