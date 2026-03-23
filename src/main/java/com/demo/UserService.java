@@ -5,40 +5,32 @@ import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
-/**
- * UserService - manages user operations.
- *
- * NOTE: This class intentionally contains bugs and bad practices
- * so that Claude AI has real issues to catch during code review.
- */
 public class UserService {
 
-    // BAD PRACTICE: hardcoded credentials in source code
     private static final String DB_URL = "jdbc:mysql://localhost:3306/mydb";
     private static final String DB_USER = "root";
     private static final String DB_PASS = "password123";
 
+    private static final String SECRET_KEY = "mySecretKey123";   // hardcoded secret
+    private static int loginAttempts = 0;                        // shared mutable state, not thread-safe
+
     private List<User> users = new ArrayList<>();
 
-    /**
-     * BUG: uses == instead of .equals() for String comparison.
-     */
+    // BUG: == instead of .equals()
     public boolean isAdminUser(String role) {
         return role == "ADMIN";
     }
 
-    /**
-     * BUG: no null check on the user parameter.
-     */
+    // BUG: no null check — NPE if user is null
     public String getUserEmail(User user) {
         return user.getEmail();
     }
 
-    /**
-     * SECURITY VULNERABILITY: SQL injection via string concatenation.
-     */
+    // SECURITY: SQL injection via string concat
     public User findUserByName(String name) {
         String sql = "SELECT * FROM users WHERE name = '" + name + "'";
         try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
@@ -48,14 +40,12 @@ public class UserService {
                 return new User(rs.getInt("id"), rs.getString("name"), rs.getString("email"));
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            e.printStackTrace();   // swallowed exception
         }
         return null;
     }
 
-    /**
-     * PERFORMANCE ISSUE: String concatenation in a loop.
-     */
+    // PERFORMANCE: String concat in loop — should use StringBuilder
     public String buildUserReport(List<User> userList) {
         String report = "";
         for (User u : userList) {
@@ -64,16 +54,12 @@ public class UserService {
         return report;
     }
 
-    /**
-     * CLEAN CODE VIOLATION: magic numbers, poor variable name.
-     */
+    // CLEAN CODE: magic numbers, single-letter param name
     public boolean isValidAge(int a) {
         return a > 18 && a < 120;
     }
 
-    /**
-     * BUG: integer division loses decimal precision.
-     */
+    // BUG: integer division truncates decimal result
     public double calculateAverageAge(List<User> userList) {
         int total = 0;
         for (User u : userList) {
@@ -82,9 +68,7 @@ public class UserService {
         return total / userList.size();
     }
 
-    /**
-     * BAD PRACTICE: returns null instead of Optional or empty list.
-     */
+    // BAD PRACTICE: returns null instead of Optional.empty() or empty list
     public List<User> getActiveUsers() {
         if (users.isEmpty()) {
             return null;
@@ -92,54 +76,119 @@ public class UserService {
         return users;
     }
 
-    /**
-     * THREAD SAFETY ISSUE: non-atomic check-then-act.
-     */
+    // THREAD SAFETY: non-atomic check-then-act
     public void addUser(User user) {
         if (!users.contains(user)) {
             users.add(user);
         }
     }
 
-    // NEW: search users by email — no null check, no case-insensitive handling
+    // BUG: == instead of .equals() for email comparison
     public User findByEmail(String email) {
         for (User u : users) {
-            if (u.getEmail() == email) {   // BUG: == instead of .equals()
+            if (u.getEmail() == email) {
                 return u;
             }
         }
         return null;
     }
 
-    // ── NEW METHOD added in this PR ──────────────────────────────────────────
-
-    /**
-     * Validates a user password.
-     * BUG: stores and compares passwords as plain text (no hashing).
-     * BUG: weak minimum length check only — no complexity rules.
-     * BUG: == used for String comparison again.
-     */
+    // SECURITY: plaintext password, == comparison, magic number, no complexity check
     public boolean validatePassword(String input, String stored) {
-        if (input.length() < 6) {           // magic number, too short
+        if (input.length() < 6) {
             return false;
         }
-        return input == stored;             // BUG: == instead of .equals()
+        return input == stored;
     }
 
-    /**
-     * Resets a user's password directly in the database.
-     * SECURITY: no authorization check — any caller can reset any user's password.
-     * SECURITY: new password written to DB in plain text (no hashing).
-     * SECURITY: SQL injection via string concat.
-     */
+    // SECURITY: SQL injection + plaintext password stored + no auth check
     public void resetPassword(int userId, String newPassword) {
         String sql = "UPDATE users SET password = '" + newPassword + "' WHERE id = " + userId;
         try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
              Statement stmt = conn.createStatement()) {
             stmt.executeUpdate(sql);
         } catch (Exception e) {
-            // BAD: silently swallowing the exception
-            System.out.println("Error: " + e.getMessage());
+            System.out.println("Error: " + e.getMessage());   // swallowed silently
+        }
+    }
+
+    // NEW: login — multiple issues below
+    public String login(String username, String password) {
+        // BUG: no brute-force protection — loginAttempts is never checked or limited
+        loginAttempts++;
+
+        // SECURITY: SQL injection
+        String sql = "SELECT * FROM users WHERE username='" + username
+                + "' AND password='" + password + "'";
+
+        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+
+            if (rs.next()) {
+                // SECURITY: hardcoded secret key used to "generate" token — trivially guessable
+                String token = SECRET_KEY + "_" + username + "_" + System.currentTimeMillis();
+                return token;
+            }
+        } catch (Exception e) {
+            // BAD: exception silently swallowed
+        }
+        return null;   // BAD: return null instead of Optional
+    }
+
+    // NEW: delete user — dangerous issues
+    public void deleteUser(String username) {
+        // SECURITY: SQL injection — username goes straight into the query
+        String sql = "DELETE FROM users WHERE username = '" + username + "'";
+
+        // BUG: no check whether the user actually exists before deleting
+        // BUG: no authorization — any caller can delete any user
+        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+             Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate(sql);
+        } catch (Exception e) {
+            // BAD: swallowed exception — caller never knows if delete failed
+        }
+    }
+
+    // NEW: export user data — information exposure risk
+    public Map<String, String> exportUserData(int userId) {
+        Map<String, String> data = new HashMap<>();
+
+        // SECURITY: SQL injection via userId (int cast protects here, but pattern is unsafe)
+        String sql = "SELECT * FROM users WHERE id = " + userId;
+
+        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sql)) {
+
+            if (rs.next()) {
+                data.put("username", rs.getString("username"));
+                data.put("email",    rs.getString("email"));
+                data.put("password", rs.getString("password")); // SECURITY: exposing plaintext password
+                data.put("ssn",      rs.getString("ssn"));      // SECURITY: exposing sensitive PII
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        // BAD: returns empty map (not null, better) but caller cannot tell if user was not found
+        return data;
+    }
+
+    // NEW: update email — missing validation
+    public void updateEmail(int userId, String newEmail) {
+        // BUG: no format validation on newEmail — any string accepted
+        // BUG: no null check on newEmail — NPE on .contains()
+        if (newEmail.contains("@")) {
+            // SECURITY: SQL injection
+            String sql = "UPDATE users SET email = '" + newEmail + "' WHERE id = " + userId;
+            try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+                 Statement stmt = conn.createStatement()) {
+                stmt.executeUpdate(sql);
+            } catch (Exception e) {
+                // swallowed
+            }
         }
     }
 
@@ -157,10 +206,10 @@ public class UserService {
             this.email = email;
         }
 
-        public int getId()      { return id; }
-        public String getName() { return name; }
-        public String getEmail(){ return email; }
-        public int getAge()     { return age; }
+        public int getId()       { return id; }
+        public String getName()  { return name; }
+        public String getEmail() { return email; }
+        public int getAge()      { return age; }
         public void setAge(int age) { this.age = age; }
     }
 }
