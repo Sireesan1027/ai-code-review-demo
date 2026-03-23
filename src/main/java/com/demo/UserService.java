@@ -24,48 +24,40 @@ public class UserService {
 
     /**
      * BUG: uses == instead of .equals() for String comparison.
-     * This will fail for non-interned strings at runtime.
      */
     public boolean isAdminUser(String role) {
-        return role == "ADMIN"; // BUG: should be role.equals("ADMIN")
+        return role == "ADMIN";
     }
 
     /**
      * BUG: no null check on the user parameter.
-     * Calling getUserEmail(null) will throw NullPointerException.
      */
     public String getUserEmail(User user) {
-        return user.getEmail(); // BUG: no null check before dereferencing
+        return user.getEmail();
     }
 
     /**
-     * SECURITY VULNERABILITY: raw SQL string concatenation → SQL injection.
-     * An attacker can pass: "'; DROP TABLE users; --"
+     * SECURITY VULNERABILITY: SQL injection via string concatenation.
      */
     public User findUserByName(String name) {
-        // VULNERABILITY: never concatenate user input directly into SQL
         String sql = "SELECT * FROM users WHERE name = '" + name + "'";
-
         try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
              Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
-
             if (rs.next()) {
                 return new User(rs.getInt("id"), rs.getString("name"), rs.getString("email"));
             }
         } catch (Exception e) {
-            // BAD PRACTICE: swallowing exception silently
             e.printStackTrace();
         }
         return null;
     }
 
     /**
-     * PERFORMANCE ISSUE: inefficient string concatenation in a loop.
-     * Should use StringBuilder instead.
+     * PERFORMANCE ISSUE: String concatenation in a loop.
      */
     public String buildUserReport(List<User> userList) {
-        String report = ""; // BAD: String is immutable; each += creates a new object
+        String report = "";
         for (User u : userList) {
             report += "User: " + u.getName() + ", Email: " + u.getEmail() + "\n";
         }
@@ -73,41 +65,71 @@ public class UserService {
     }
 
     /**
-     * CLEAN CODE VIOLATION: magic numbers, unclear variable names.
+     * CLEAN CODE VIOLATION: magic numbers, poor variable name.
      */
     public boolean isValidAge(int a) {
-        return a > 18 && a < 120; // magic numbers 18 and 120 should be named constants
+        return a > 18 && a < 120;
     }
 
     /**
-     * BUG: integer division truncates result; should use double or BigDecimal.
+     * BUG: integer division loses decimal precision.
      */
     public double calculateAverageAge(List<User> userList) {
         int total = 0;
         for (User u : userList) {
             total += u.getAge();
         }
-        return total / userList.size(); // BUG: integer division loses precision
+        return total / userList.size();
     }
 
     /**
      * BAD PRACTICE: returns null instead of Optional or empty list.
-     * Callers must always null-check, which is easy to forget.
      */
     public List<User> getActiveUsers() {
         if (users.isEmpty()) {
-            return null; // BAD: return Collections.emptyList() instead
+            return null;
         }
         return users;
     }
 
     /**
-     * THREAD SAFETY ISSUE: non-atomic check-then-act on a shared list.
-     * In a multi-threaded context this can cause duplicates.
+     * THREAD SAFETY ISSUE: non-atomic check-then-act.
      */
     public void addUser(User user) {
-        if (!users.contains(user)) { // RACE CONDITION: another thread may add between check and add
+        if (!users.contains(user)) {
             users.add(user);
+        }
+    }
+
+    // ── NEW METHOD added in this PR ──────────────────────────────────────────
+
+    /**
+     * Validates a user password.
+     * BUG: stores and compares passwords as plain text (no hashing).
+     * BUG: weak minimum length check only — no complexity rules.
+     * BUG: == used for String comparison again.
+     */
+    public boolean validatePassword(String input, String stored) {
+        if (input.length() < 6) {           // magic number, too short
+            return false;
+        }
+        return input == stored;             // BUG: == instead of .equals()
+    }
+
+    /**
+     * Resets a user's password directly in the database.
+     * SECURITY: no authorization check — any caller can reset any user's password.
+     * SECURITY: new password written to DB in plain text (no hashing).
+     * SECURITY: SQL injection via string concat.
+     */
+    public void resetPassword(int userId, String newPassword) {
+        String sql = "UPDATE users SET password = '" + newPassword + "' WHERE id = " + userId;
+        try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS);
+             Statement stmt = conn.createStatement()) {
+            stmt.executeUpdate(sql);
+        } catch (Exception e) {
+            // BAD: silently swallowing the exception
+            System.out.println("Error: " + e.getMessage());
         }
     }
 
