@@ -4,6 +4,34 @@ on:
   pull_request:
     types: [opened, synchronize]
 
+env:
+  REVIEW_PROMPT: |
+    You are a senior Java code reviewer. Review ONLY the Java source file changes in the diff below.
+    Ignore any changes to YAML, shell scripts, config, or workflow files.
+
+    For each issue, mention the exact line number from the diff (e.g. "Line 42:").
+    Keep each point to one concise sentence. No long explanations.
+
+    Focus on:
+    - Security vulnerabilities (SQL injection, hardcoded credentials, missing auth checks)
+    - Bugs (== vs .equals(), NPE risks, integer division, race conditions)
+    - Java best practices (use Optional, avoid returning null, use StringBuilder)
+    - Performance (inefficient loops, unnecessary object creation)
+    - Clean code (magic numbers, poor names, swallowed exceptions)
+
+    Respond ONLY in this format (omit sections with nothing to report):
+
+    **Critical** (must fix before merge)
+    - Line X: issue description
+
+    **Warnings** (should fix)
+    - Line X: issue description
+
+    **Suggestions** (optional improvements)
+    - Line X: suggestion
+
+    **Verdict:** MERGE or REQUEST CHANGES — one sentence reason.
+
 jobs:
 
   # ── Claude AI Review ────────────────────────────────────────────────────────
@@ -39,39 +67,16 @@ jobs:
 
           DIFF=$(head -c 8000 /tmp/pr_diff.txt)
 
-          # Build prompt as a file to avoid shell quoting issues
-          cat > /tmp/prompt.txt << 'PROMPT_EOF'
-          You are a senior Java code reviewer. Review the following git diff.
-
-          Check for:
-          1. Bugs & Logic Errors (NPE, == vs .equals, integer division)
-          2. Java Best Practices (Optional, generics, immutability)
-          3. Maven / Build Issues
-          4. Performance Problems (String concat in loops)
-          5. Security Vulnerabilities (SQL injection, hardcoded credentials)
-          6. Clean Code Violations (magic numbers, poor naming)
-
-          Format your response EXACTLY as:
-          ## Critical Issues
-          ## Warnings
-          ## Suggestions
-          ## Well Done
-          ## Verdict (end with MERGE or REQUEST CHANGES)
-          PROMPT_EOF
-
-          PROMPT=$(cat /tmp/prompt.txt)
-
-          # jq --arg safely encodes all special characters
           RESPONSE=$(jq -n \
             --arg model "claude-sonnet-4-20250514" \
-            --arg prompt "$PROMPT" \
+            --arg prompt "$REVIEW_PROMPT" \
             --arg diff "$DIFF" \
             '{
               model: $model,
-              max_tokens: 2048,
+              max_tokens: 1024,
               messages: [{
                 role: "user",
-                content: ($prompt + "\n\nGit diff:\n```diff\n" + $diff + "\n```")
+                content: ($prompt + "\n\nDiff:\n```diff\n" + $diff + "\n```")
               }]
             }' | \
           curl -s -X POST https://api.anthropic.com/v1/messages \
@@ -97,10 +102,8 @@ jobs:
             exit 0
           fi
 
-          # Write full comment body to a file, then encode with jq -Rs
           {
             echo "## Claude AI Code Review"
-            echo ""
             echo "Powered by Claude \`claude-sonnet-4-20250514\`"
             echo ""
             cat /tmp/claude_review.txt
@@ -150,40 +153,18 @@ jobs:
 
           DIFF=$(head -c 10000 /tmp/pr_diff.txt)
 
-          cat > /tmp/prompt.txt << 'PROMPT_EOF'
-          You are a senior Java code reviewer. Review the following git diff.
-
-          Check for:
-          1. Bugs & Logic Errors (NPE, == vs .equals, integer division)
-          2. Java Best Practices (Optional, generics, immutability)
-          3. Maven / Build Issues
-          4. Performance Problems (String concat in loops)
-          5. Security Vulnerabilities (SQL injection, hardcoded credentials)
-          6. Clean Code Violations (magic numbers, poor naming)
-
-          Format your response EXACTLY as:
-          ## Critical Issues
-          ## Warnings
-          ## Suggestions
-          ## Well Done
-          ## Verdict (end with MERGE or REQUEST CHANGES)
-          PROMPT_EOF
-
-          PROMPT=$(cat /tmp/prompt.txt)
-
-          # Groq uses OpenAI-compatible chat/completions format
           RESPONSE=$(jq -n \
             --arg model "llama-3.3-70b-versatile" \
-            --arg system "You are a senior Java code reviewer. Be specific and actionable." \
-            --arg prompt "$PROMPT" \
+            --arg system "You are a senior Java code reviewer. Review only Java files. Be concise and mention line numbers." \
+            --arg prompt "$REVIEW_PROMPT" \
             --arg diff "$DIFF" \
             '{
               model: $model,
-              max_tokens: 2048,
-              temperature: 0.3,
+              max_tokens: 1024,
+              temperature: 0.2,
               messages: [
                 { role: "system", content: $system },
-                { role: "user", content: ($prompt + "\n\nGit diff:\n```diff\n" + $diff + "\n```") }
+                { role: "user", content: ($prompt + "\n\nDiff:\n```diff\n" + $diff + "\n```") }
               ]
             }' | \
           curl -s -X POST https://api.groq.com/openai/v1/chat/completions \
@@ -214,8 +195,7 @@ jobs:
 
           {
             echo "## Groq AI Code Review"
-            echo ""
-            echo "Powered by Groq \`$MODEL\` (llama-3.3-70b-versatile)"
+            echo "Powered by Groq \`$MODEL\`"
             echo ""
             cat /tmp/groq_review.txt
           } > /tmp/groq_comment.txt
