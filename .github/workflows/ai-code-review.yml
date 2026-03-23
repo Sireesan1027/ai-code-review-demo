@@ -50,11 +50,14 @@ jobs:
 
       - name: Get PR diff
         run: |
+          # Filter to Java files only so workflow/config changes don't fill the buffer
           git diff \
             ${{ github.event.pull_request.base.sha }} \
             ${{ github.event.pull_request.head.sha }} \
+            -- '*.java' \
             > /tmp/pr_diff.txt
           echo "Diff size: $(wc -c < /tmp/pr_diff.txt) bytes"
+          cat /tmp/pr_diff.txt
 
       - name: Send diff to Claude
         env:
@@ -136,11 +139,14 @@ jobs:
 
       - name: Get PR diff
         run: |
+          # Filter to Java files only so workflow/config changes don't fill the buffer
           git diff \
             ${{ github.event.pull_request.base.sha }} \
             ${{ github.event.pull_request.head.sha }} \
+            -- '*.java' \
             > /tmp/pr_diff.txt
           echo "Diff size: $(wc -c < /tmp/pr_diff.txt) bytes"
+          cat /tmp/pr_diff.txt
 
       - name: Send diff to Groq
         env:
