@@ -1,0 +1,186 @@
+name: AI Code Review with Claude
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trigger: run whenever a PR is opened or new commits are pushed to a PR.
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  ai-review:
+    name: Claude AI Code Review
+    runs-on: ubuntu-latest
+
+    # Give the workflow permission to read PR contents and post comments.
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+
+      # ───────────────────────────────────────────────────────────────────────
+      # Step 1 – Check out the full git history so we can compute the diff.
+      # fetch-depth: 0 means "fetch all commits", which is needed for git diff.
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ───────────────────────────────────────────────────────────────────────
+      # Step 2 – Install jq (JSON processor used to build/parse API payloads).
+      # On ubuntu-latest jq is usually pre-installed, but we pin it explicitly.
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Install jq
+        run: sudo apt-get install -y jq
+
+      # ───────────────────────────────────────────────────────────────────────
+      # Step 3 – Compute the unified diff between the PR branch and its base.
+      #
+      # github.event.pull_request.base.sha  → last commit on the base branch
+      # github.event.pull_request.head.sha  → tip commit of the PR branch
+      #
+      # We write the diff to a temp file to avoid shell quoting issues when the
+      # diff is large or contains special characters.
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Get PR diff
+        id: diff
+        run: |
+          git diff \
+            ${{ github.event.pull_request.base.sha }} \
+            ${{ github.event.pull_request.head.sha }} \
+            > /tmp/pr_diff.txt
+
+          # Truncate to 8 000 characters so the prompt stays within token limits.
+          # Claude's context window is large but we keep the payload reasonable.
+          DIFF_CONTENT=$(head -c 8000 /tmp/pr_diff.txt)
+
+          # Save into a multi-line GitHub Actions output variable.
+          echo "diff_content<<EOF" >> $GITHUB_OUTPUT
+          echo "$DIFF_CONTENT"     >> $GITHUB_OUTPUT
+          echo "EOF"               >> $GITHUB_OUTPUT
+
+      # ───────────────────────────────────────────────────────────────────────
+      # Step 4 – Call the Claude API with a structured Java code-review prompt.
+      #
+      # We use the claude-sonnet-4-20250514 model (latest Sonnet at time of
+      # writing). Adjust max_tokens if you need longer reviews.
+      #
+      # ANTHROPIC_API_KEY must be stored as a GitHub Actions secret:
+      #   Repository → Settings → Secrets → Actions → New repository secret
+      #   Name:  ANTHROPIC_API_KEY
+      #   Value: sk-ant-...
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Send diff to Claude for review
+        id: claude_review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # ── Build the review prompt ──────────────────────────────────────
+          # We interpolate the diff into a JSON payload using jq's --arg flag,
+          # which safely escapes newlines and special characters automatically.
+          PROMPT="You are a senior Java code reviewer. Review the following git diff and provide structured feedback.
+
+          Analyse the changes for:
+          1. **Bugs & Logic Errors** – NullPointerExceptions, == vs .equals(), integer division, unchecked casts, etc.
+          2. **Java Best Practices** – proper use of Optional, Collections, generics, access modifiers, immutability.
+          3. **Maven / Build Issues** – missing dependency scopes, plugin version pins, missing test frameworks.
+          4. **Performance Problems** – String concatenation in loops, N+1 queries, unnecessary object creation.
+          5. **Security Vulnerabilities** – SQL injection, hardcoded credentials, missing input validation, XSS.
+          6. **Clean Code Violations** – magic numbers, poor naming, dead code, missing Javadoc on public API.
+
+          Format your response EXACTLY as follows:
+
+          ## 🔴 Critical Issues
+          List any bugs or security vulnerabilities that must be fixed before merge.
+
+          ## ⚠️ Warnings
+          List bad practices and code smells that should be fixed.
+
+          ## 💡 Suggestions
+          List optional improvements and enhancements.
+
+          ## ✅ Well Done
+          List anything done correctly or following good practices.
+
+          ## 📋 Verdict
+          A one-sentence overall assessment and a MERGE / REQUEST CHANGES recommendation.
+
+          ---
+          Here is the git diff to review:
+
+          \`\`\`diff
+          $1
+          \`\`\`"
+
+          # ── Call Claude API ───────────────────────────────────────────────
+          # jq --arg safely encodes both the prompt text and the diff content.
+          RESPONSE=$(jq -n \
+            --arg model  "claude-sonnet-4-20250514" \
+            --arg prompt "$PROMPT" \
+            --arg diff   "$(cat /tmp/pr_diff.txt | head -c 8000)" \
+            '{
+              model: $model,
+              max_tokens: 2048,
+              messages: [
+                {
+                  role: "user",
+                  content: ($prompt + "\n\n```diff\n" + $diff + "\n```")
+                }
+              ]
+            }' | \
+          curl -s \
+            -X POST https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d @-)
+
+          # ── Extract the text content from Claude's JSON response ──────────
+          # The response shape is: { "content": [ { "type": "text", "text": "..." } ] }
+          REVIEW_TEXT=$(echo "$RESPONSE" | jq -r '.content[0].text // "Claude returned no content – check API key and quota."')
+
+          # ── Persist to output variable for the next step ──────────────────
+          echo "review<<EOF"    >> $GITHUB_OUTPUT
+          echo "$REVIEW_TEXT"   >> $GITHUB_OUTPUT
+          echo "EOF"            >> $GITHUB_OUTPUT
+
+          # ── Also print in workflow logs for debugging ─────────────────────
+          echo "──── Claude Review ────"
+          echo "$REVIEW_TEXT"
+
+      # ───────────────────────────────────────────────────────────────────────
+      # Step 5 – Post the Claude review as a PR comment.
+      #
+      # GITHUB_TOKEN is provided automatically by GitHub Actions – no setup
+      # needed. It has write access to the repository for the duration of the
+      # workflow run.
+      # ───────────────────────────────────────────────────────────────────────
+      - name: Post review comment on PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER:    ${{ github.event.pull_request.number }}
+          REPO:         ${{ github.repository }}
+        run: |
+          # ── Build the comment body ────────────────────────────────────────
+          # Add a header so it is easy to spot in the PR timeline.
+          COMMENT_BODY="## 🤖 Claude AI Code Review
+
+          > Powered by [Claude AI](https://www.anthropic.com) · Model: \`claude-sonnet-4-20250514\`
+
+          ${{ steps.claude_review.outputs.review }}"
+
+          # ── POST to the GitHub REST API ───────────────────────────────────
+          # Endpoint: POST /repos/{owner}/{repo}/issues/{issue_number}/comments
+          # (GitHub uses the issues endpoint for PR comments)
+          jq -n --arg body "$COMMENT_BODY" '{ body: $body }' | \
+          curl -s \
+            -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
+            -d @-
+
+          echo "Review comment posted to PR #$PR_NUMBER"
