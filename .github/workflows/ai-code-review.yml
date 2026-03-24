@@ -1,289 +1,218 @@
 name: AI Code Review (Claude + Groq)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Trigger: run on every new PR and every new push to an existing PR.
-# ─────────────────────────────────────────────────────────────────────────────
 on:
   pull_request:
     types: [opened, synchronize]
 
+env:
+  REVIEW_PROMPT: |
+    You are a senior Java code reviewer. Review ONLY the Java source file changes in the diff below.
+    Ignore any changes to YAML, shell scripts, config, or workflow files.
+
+    For each issue, mention the exact line number from the diff (e.g. "Line 42:").
+    Keep each point to one concise sentence. No long explanations.
+
+    Focus on:
+    - Security vulnerabilities (SQL injection, hardcoded credentials, missing auth checks)
+    - Bugs (== vs .equals(), NPE risks, integer division, race conditions)
+    - Java best practices (use Optional, avoid returning null, use StringBuilder)
+    - Performance (inefficient loops, unnecessary object creation)
+    - Clean code (magic numbers, poor names, swallowed exceptions)
+
+    Respond ONLY in this format (omit sections with nothing to report):
+
+    **Critical** (must fix before merge)
+    - Line X: issue description
+
+    **Warnings** (should fix)
+    - Line X: issue description
+
+    **Suggestions** (optional improvements)
+    - Line X: suggestion
+
+    **Verdict:** MERGE or REQUEST CHANGES — one sentence reason.
+
 jobs:
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # JOB 1 – Claude AI review (runs when ANTHROPIC_API_KEY secret is set)
-  # ───────────────────────────────────────────────────────────────────────────
+  # ── Claude AI Review ────────────────────────────────────────────────────────
   claude-review:
     name: Claude AI Review
+    if: false   # disabled — Groq only for now
     runs-on: ubuntu-latest
-    # Skip this job gracefully if the Anthropic key is not configured.
-    # The job is still created so the workflow doesn't show as "failed".
-    if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
-
     permissions:
       contents: read
       pull-requests: write
 
     steps:
-
-      # ── 1. Checkout with full history for git diff ────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ── 2. Ensure jq is available ─────────────────────────────────────────
-      - name: Install jq
-        run: sudo apt-get install -y jq
-
-      # ── 3. Compute the unified diff of the PR ────────────────────────────
       - name: Get PR diff
-        id: diff
         run: |
+          # Filter to Java files only so workflow/config changes don't fill the buffer
           git diff \
             ${{ github.event.pull_request.base.sha }} \
             ${{ github.event.pull_request.head.sha }} \
+            -- '*.java' \
             > /tmp/pr_diff.txt
-
           echo "Diff size: $(wc -c < /tmp/pr_diff.txt) bytes"
+          cat /tmp/pr_diff.txt
 
-      # ── 4. Call Claude API ────────────────────────────────────────────────
-      # Model: claude-sonnet-4-20250514
-      # Endpoint: https://api.anthropic.com/v1/messages
-      # Docs: https://docs.anthropic.com/en/api/messages
       - name: Send diff to Claude
-        id: claude_review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          # Truncate diff to 8 000 chars to stay within a reasonable token budget
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "ANTHROPIC_API_KEY not set, skipping Claude review."
+            exit 0
+          fi
+
           DIFF=$(head -c 8000 /tmp/pr_diff.txt)
 
-          # Build the structured Java review prompt
-          PROMPT='You are a senior Java code reviewer. Review the following git diff and provide structured feedback.
-
-          Analyse the changes for:
-          1. Bugs & Logic Errors – NullPointerExceptions, == vs .equals(), integer division, unchecked casts.
-          2. Java Best Practices – Optional, Collections, generics, access modifiers, immutability.
-          3. Maven / Build Issues – missing dependency scopes, missing plugin version pins.
-          4. Performance Problems – String concatenation in loops, unnecessary object creation.
-          5. Security Vulnerabilities – SQL injection, hardcoded credentials, missing input validation.
-          6. Clean Code Violations – magic numbers, poor naming, dead code, missing Javadoc on public API.
-
-          Format your response EXACTLY as follows:
-
-          ## 🔴 Critical Issues
-          Bugs or security vulnerabilities that MUST be fixed before merge.
-
-          ## ⚠️ Warnings
-          Bad practices and code smells that should be fixed.
-
-          ## 💡 Suggestions
-          Optional improvements and enhancements.
-
-          ## ✅ Well Done
-          Anything done correctly or following good practices.
-
-          ## 📋 Verdict
-          One-sentence overall assessment and a MERGE / REQUEST CHANGES recommendation.'
-
-          # Use jq to safely encode both prompt and diff into JSON (handles quotes, newlines, etc.)
           RESPONSE=$(jq -n \
-            --arg model  "claude-sonnet-4-20250514" \
-            --arg prompt "$PROMPT" \
-            --arg diff   "$DIFF" \
+            --arg model "claude-sonnet-4-20250514" \
+            --arg prompt "$REVIEW_PROMPT" \
+            --arg diff "$DIFF" \
             '{
               model: $model,
-              max_tokens: 2048,
+              max_tokens: 1024,
               messages: [{
                 role: "user",
-                content: ($prompt + "\n\nHere is the git diff:\n\n```diff\n" + $diff + "\n```")
+                content: ($prompt + "\n\nDiff:\n```diff\n" + $diff + "\n```")
               }]
             }' | \
-          curl -s \
-            -X POST https://api.anthropic.com/v1/messages \
+          curl -s -X POST https://api.anthropic.com/v1/messages \
             -H "Content-Type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -d @-)
 
-          # Extract the review text from Claude's response
-          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text // "Claude returned no content – check ANTHROPIC_API_KEY secret."')
+          echo "$RESPONSE" | jq -r '.content[0].text // "Claude returned no content."' \
+            > /tmp/claude_review.txt
 
-          # Save to output variable (multi-line safe)
-          echo "review<<EOF"  >> $GITHUB_OUTPUT
-          echo "$REVIEW"      >> $GITHUB_OUTPUT
-          echo "EOF"          >> $GITHUB_OUTPUT
+          echo "=== Claude Review ==="
+          cat /tmp/claude_review.txt
 
-          echo "──── Claude Review ────"
-          echo "$REVIEW"
-
-      # ── 5. Post Claude's review as a PR comment ───────────────────────────
-      # GITHUB_TOKEN is injected automatically – no manual secret needed.
       - name: Post Claude review comment
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER:    ${{ github.event.pull_request.number }}
-          REPO:         ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          COMMENT="## 🤖 Claude AI Code Review
+          if [ ! -f /tmp/claude_review.txt ]; then
+            echo "Claude was skipped, no comment to post."
+            exit 0
+          fi
 
-          > Powered by **Claude** (claude-sonnet-4-20250514) · [Anthropic](https://www.anthropic.com)
+          {
+            echo "## Claude AI Code Review"
+            echo "Powered by Claude \`claude-sonnet-4-20250514\`"
+            echo ""
+            cat /tmp/claude_review.txt
+          } > /tmp/claude_comment.txt
 
-          ${{ steps.claude_review.outputs.review }}"
-
-          jq -n --arg body "$COMMENT" '{ body: $body }' | \
-          curl -s \
-            -X POST \
+          jq -Rs '{ body: . }' /tmp/claude_comment.txt | \
+          curl -s -X POST \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
             -d @-
 
-          echo "Claude review posted to PR #$PR_NUMBER"
+          echo "Claude comment posted to PR #$PR_NUMBER"
 
 
-  # ───────────────────────────────────────────────────────────────────────────
-  # JOB 2 – Groq AI review (runs when GROQ_API_KEY secret is set)
-  # Groq exposes an OpenAI-compatible REST API at api.groq.com/openai/v1
-  # Free tier available at console.groq.com
-  # ───────────────────────────────────────────────────────────────────────────
+  # ── Groq AI Review ──────────────────────────────────────────────────────────
   groq-review:
     name: Groq AI Review
     runs-on: ubuntu-latest
-    # Skip gracefully if the Groq key is not configured.
-    if: ${{ secrets.GROQ_API_KEY != '' }}
-
     permissions:
       contents: read
       pull-requests: write
 
     steps:
-
-      # ── 1. Checkout with full history for git diff ────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ── 2. Ensure jq is available ─────────────────────────────────────────
-      - name: Install jq
-        run: sudo apt-get install -y jq
-
-      # ── 3. Compute the unified diff of the PR ────────────────────────────
       - name: Get PR diff
-        id: diff
         run: |
+          # Filter to Java files only so workflow/config changes don't fill the buffer
           git diff \
             ${{ github.event.pull_request.base.sha }} \
             ${{ github.event.pull_request.head.sha }} \
+            -- '*.java' \
             > /tmp/pr_diff.txt
-
           echo "Diff size: $(wc -c < /tmp/pr_diff.txt) bytes"
+          cat /tmp/pr_diff.txt
 
-      # ── 4. Call Groq API ──────────────────────────────────────────────────
-      # Model: llama-3.3-70b-versatile (best free Groq model for code review)
-      # Endpoint: https://api.groq.com/openai/v1/chat/completions
-      # Groq is OpenAI-compatible — uses the same chat/completions format.
-      # Docs: https://console.groq.com/docs/openai
       - name: Send diff to Groq
-        id: groq_review
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
-          # Groq has generous context, but cap at 10 000 chars to be safe
+          if [ -z "$GROQ_API_KEY" ]; then
+            echo "GROQ_API_KEY not set, skipping Groq review."
+            exit 0
+          fi
+
           DIFF=$(head -c 10000 /tmp/pr_diff.txt)
 
-          PROMPT='You are a senior Java code reviewer. Review the following git diff and provide structured feedback.
-
-          Analyse the changes for:
-          1. Bugs & Logic Errors – NullPointerExceptions, == vs .equals(), integer division, unchecked casts.
-          2. Java Best Practices – Optional, Collections, generics, access modifiers, immutability.
-          3. Maven / Build Issues – missing dependency scopes, missing plugin version pins.
-          4. Performance Problems – String concatenation in loops, unnecessary object creation.
-          5. Security Vulnerabilities – SQL injection, hardcoded credentials, missing input validation.
-          6. Clean Code Violations – magic numbers, poor naming, dead code, missing Javadoc on public API.
-
-          Format your response EXACTLY as follows:
-
-          ## 🔴 Critical Issues
-          Bugs or security vulnerabilities that MUST be fixed before merge.
-
-          ## ⚠️ Warnings
-          Bad practices and code smells that should be fixed.
-
-          ## 💡 Suggestions
-          Optional improvements and enhancements.
-
-          ## ✅ Well Done
-          Anything done correctly or following good practices.
-
-          ## 📋 Verdict
-          One-sentence overall assessment and a MERGE / REQUEST CHANGES recommendation.'
-
-          # Groq uses OpenAI-compatible JSON format
           RESPONSE=$(jq -n \
-            --arg model  "llama-3.3-70b-versatile" \
-            --arg prompt "$PROMPT" \
-            --arg diff   "$DIFF" \
+            --arg model "llama-3.3-70b-versatile" \
+            --arg system "You are a senior Java code reviewer. Review only Java files. Be concise and mention line numbers." \
+            --arg prompt "$REVIEW_PROMPT" \
+            --arg diff "$DIFF" \
             '{
               model: $model,
-              max_tokens: 2048,
-              temperature: 0.3,
+              max_tokens: 1024,
+              temperature: 0.2,
               messages: [
-                {
-                  role: "system",
-                  content: "You are a senior Java code reviewer. Be specific, concise, and actionable."
-                },
-                {
-                  role: "user",
-                  content: ($prompt + "\n\nHere is the git diff:\n\n```diff\n" + $diff + "\n```")
-                }
+                { role: "system", content: $system },
+                { role: "user", content: ($prompt + "\n\nDiff:\n```diff\n" + $diff + "\n```") }
               ]
             }' | \
-          curl -s \
-            -X POST https://api.groq.com/openai/v1/chat/completions \
+          curl -s -X POST https://api.groq.com/openai/v1/chat/completions \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $GROQ_API_KEY" \
             -d @-)
 
-          # Groq follows OpenAI response shape: .choices[0].message.content
-          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "Groq returned no content – check GROQ_API_KEY secret."')
+          echo "$RESPONSE" | jq -r '.choices[0].message.content // "Groq returned no content."' \
+            > /tmp/groq_review.txt
+          echo "$RESPONSE" | jq -r '.model // "llama-3.3-70b-versatile"' \
+            > /tmp/groq_model.txt
 
-          # Also show which model Groq actually used (may differ from requested)
-          MODEL_USED=$(echo "$RESPONSE" | jq -r '.model // "llama-3.3-70b-versatile"')
+          echo "=== Groq Review ($(cat /tmp/groq_model.txt)) ==="
+          cat /tmp/groq_review.txt
 
-          echo "review<<EOF"     >> $GITHUB_OUTPUT
-          echo "$REVIEW"         >> $GITHUB_OUTPUT
-          echo "EOF"             >> $GITHUB_OUTPUT
-
-          echo "model_used<<EOF" >> $GITHUB_OUTPUT
-          echo "$MODEL_USED"     >> $GITHUB_OUTPUT
-          echo "EOF"             >> $GITHUB_OUTPUT
-
-          echo "──── Groq Review ($MODEL_USED) ────"
-          echo "$REVIEW"
-
-      # ── 5. Post Groq's review as a PR comment ─────────────────────────────
       - name: Post Groq review comment
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER:    ${{ github.event.pull_request.number }}
-          REPO:         ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
-          COMMENT="## ⚡ Groq AI Code Review
+          if [ ! -f /tmp/groq_review.txt ]; then
+            echo "Groq was skipped, no comment to post."
+            exit 0
+          fi
 
-          > Powered by **Groq** (${{ steps.groq_review.outputs.model_used }}) · [console.groq.com](https://console.groq.com)
+          MODEL=$(cat /tmp/groq_model.txt)
 
-          ${{ steps.groq_review.outputs.review }}"
+          {
+            echo "## Groq AI Code Review"
+            echo "Powered by Groq \`$MODEL\`"
+            echo ""
+            cat /tmp/groq_review.txt
+          } > /tmp/groq_comment.txt
 
-          jq -n --arg body "$COMMENT" '{ body: $body }' | \
-          curl -s \
-            -X POST \
+          jq -Rs '{ body: . }' /tmp/groq_comment.txt | \
+          curl -s -X POST \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/$REPO/issues/$PR_NUMBER/comments" \
             -d @-
 
-          echo "Groq review posted to PR #$PR_NUMBER"
+          echo "Groq comment posted to PR #$PR_NUMBER"
