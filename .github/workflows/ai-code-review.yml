@@ -4,12 +4,40 @@ on:
   pull_request:
     types: [opened, synchronize]
 
+# Shared review prompt — stored in env so the run: block stays clean
+env:
+  REVIEW_PROMPT: |
+    You are a senior Java code reviewer. Review ONLY Java source file changes in the diff below.
+    Ignore YAML, shell scripts, config, or workflow files.
+
+    For each issue mention the exact line number from the diff (e.g. "Line 42:").
+    Keep each point to one concise sentence.
+
+    Focus on:
+    - Security vulnerabilities (SQL injection, hardcoded credentials, missing auth checks)
+    - Bugs (== vs .equals(), NPE risks, integer division, race conditions)
+    - Java best practices (use Optional, avoid returning null, use StringBuilder)
+    - Performance (inefficient loops, unnecessary object creation)
+    - Clean code (magic numbers, poor names, swallowed exceptions)
+
+    Respond ONLY in this format (omit sections with nothing to report):
+
+    ## Critical Issues
+    - Line X: issue description
+
+    ## Warnings
+    - Line X: issue description
+
+    ## Suggestions
+    - Line X: suggestion
+
+    ## Well Done
+    - what was done right
+
+    ## Verdict: MERGE or REQUEST CHANGES — one sentence reason.
+
 jobs:
 
-  # ── Groq AI Review ───────────────────────────────────────────────────────────
-  # Triggered on every PR open/update. Checks GROQ_API_KEY inside the step.
-  # NOTE: never use "if: secrets.X != ''" at job level — secrets context is
-  # unavailable in job-level conditions and always evaluates to false.
   groq-review:
     name: Groq AI Review
     runs-on: ubuntu-latest
@@ -27,8 +55,8 @@ jobs:
       - name: Install jq
         run: sudo apt-get install -y jq
 
-      # Get only Java file changes — avoids workflow/config noise filling the buffer
-      - name: Get PR diff (Java files only)
+      # Filter to Java files only — avoids workflow/config noise filling the buffer
+      - name: Get PR diff
         run: |
           git diff \
             ${{ github.event.pull_request.base.sha }} \
@@ -43,52 +71,22 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: |
           if [ -z "$GROQ_API_KEY" ]; then
-            echo "GROQ_API_KEY not set — skipping review."
+            echo "GROQ_API_KEY not set — skipping."
             exit 0
           fi
 
           DIFF=$(head -c 10000 /tmp/pr_diff.txt)
 
-          if [ -z "$DIFF" ]; then
-            echo "No Java file changes found — skipping review."
-            echo "No Java source file changes were found in this PR." > /tmp/groq_review.txt
+          if [ -z "$(cat /tmp/pr_diff.txt)" ]; then
+            echo "No Java changes found." > /tmp/groq_review.txt
             echo "llama-3.3-70b-versatile" > /tmp/groq_model.txt
             exit 0
           fi
 
-          PROMPT='You are a senior Java code reviewer. Review the following git diff and provide structured feedback.
-
-Analyse the changes for:
-1. Bugs & Logic Errors – NullPointerExceptions, == vs .equals(), integer division, unchecked casts.
-2. Java Best Practices – Optional, Collections, generics, access modifiers, immutability.
-3. Maven / Build Issues – missing dependency scopes, missing plugin version pins.
-4. Performance Problems – String concatenation in loops, unnecessary object creation.
-5. Security Vulnerabilities – SQL injection, hardcoded credentials, missing input validation.
-6. Clean Code Violations – magic numbers, poor naming, dead code, missing Javadoc on public API.
-
-For each issue mention the exact line number from the diff (e.g. "Line 42:").
-
-Format your response EXACTLY as follows:
-
-## Critical Issues
-Bugs or security vulnerabilities that MUST be fixed before merge.
-
-## Warnings
-Bad practices and code smells that should be fixed.
-
-## Suggestions
-Optional improvements and enhancements.
-
-## Well Done
-Anything done correctly or following good practices.
-
-## Verdict
-One-sentence overall assessment ending with MERGE or REQUEST CHANGES.'
-
           RESPONSE=$(jq -n \
             --arg model  "llama-3.3-70b-versatile" \
-            --arg system "You are a senior Java code reviewer. Be specific, concise, and mention line numbers." \
-            --arg prompt "$PROMPT" \
+            --arg system "You are a senior Java code reviewer. Be concise and mention line numbers." \
+            --arg prompt "$REVIEW_PROMPT" \
             --arg diff   "$DIFF" \
             '{
               model: $model,
@@ -104,7 +102,6 @@ One-sentence overall assessment ending with MERGE or REQUEST CHANGES.'
             -H "Authorization: Bearer $GROQ_API_KEY" \
             -d @-)
 
-          # Write to files — never store AI output in shell variables for injection into scripts
           echo "$RESPONSE" | jq -r '.choices[0].message.content // "Groq returned no content."' \
             > /tmp/groq_review.txt
           echo "$RESPONSE" | jq -r '.model // "llama-3.3-70b-versatile"' \
@@ -113,8 +110,8 @@ One-sentence overall assessment ending with MERGE or REQUEST CHANGES.'
           echo "=== Groq Review ==="
           cat /tmp/groq_review.txt
 
-      # IMPORTANT: build the comment body into a file and use jq -Rs to encode it.
-      # Never inline AI output into a shell variable — backticks get executed as commands.
+      # Build comment body into a file — never inline AI output into shell variables
+      # (backticks in AI text get executed as commands)
       - name: Post Groq review comment
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -135,7 +132,6 @@ One-sentence overall assessment ending with MERGE or REQUEST CHANGES.'
             cat /tmp/groq_review.txt
           } > /tmp/groq_comment.txt
 
-          # jq -Rs safely JSON-encodes the whole file including backticks and quotes
           jq -Rs '{ body: . }' /tmp/groq_comment.txt | \
           curl -s -X POST \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
