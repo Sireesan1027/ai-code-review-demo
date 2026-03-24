@@ -265,21 +265,34 @@ jobs:
           echo "$REVIEW"
 
       # ── 5. Post Groq's review as a PR comment ─────────────────────────────
+      # IMPORTANT: never inline the review text into a shell variable — backticks
+      # in the AI output get executed as commands. Read from file instead and
+      # use jq -Rs to safely JSON-encode the full body.
       - name: Post Groq review comment
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER:    ${{ github.event.pull_request.number }}
           REPO:         ${{ github.repository }}
         run: |
-          COMMENT="## ⚡ Groq AI Code Review
+          if [ ! -f /tmp/groq_review.txt ]; then
+            echo "No review file found, skipping comment."
+            exit 0
+          fi
 
-          > Powered by **Groq** (${{ steps.groq_review.outputs.model_used }}) · [console.groq.com](https://console.groq.com)
+          MODEL=$(cat /tmp/groq_model.txt 2>/dev/null || echo "llama-3.3-70b-versatile")
 
-          ${{ steps.groq_review.outputs.review }}"
+          # Build comment into a file — never use shell variable for AI output
+          {
+            echo "## ⚡ Groq AI Code Review"
+            echo ""
+            echo "> Powered by **Groq** \`$MODEL\` · [console.groq.com](https://console.groq.com)"
+            echo ""
+            cat /tmp/groq_review.txt
+          } > /tmp/groq_comment.txt
 
-          jq -n --arg body "$COMMENT" '{ body: $body }' | \
-          curl -s \
-            -X POST \
+          # jq -Rs safely encodes the entire file (including backticks, quotes, newlines)
+          jq -Rs '{ body: . }' /tmp/groq_comment.txt | \
+          curl -s -X POST \
             -H "Authorization: Bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
