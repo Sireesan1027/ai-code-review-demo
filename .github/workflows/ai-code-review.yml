@@ -253,13 +253,9 @@ jobs:
           # Also show which model Groq actually used (may differ from requested)
           MODEL_USED=$(echo "$RESPONSE" | jq -r '.model // "llama-3.3-70b-versatile"')
 
-          echo "review<<EOF"     >> $GITHUB_OUTPUT
-          echo "$REVIEW"         >> $GITHUB_OUTPUT
-          echo "EOF"             >> $GITHUB_OUTPUT
-
-          echo "model_used<<EOF" >> $GITHUB_OUTPUT
-          echo "$MODEL_USED"     >> $GITHUB_OUTPUT
-          echo "EOF"             >> $GITHUB_OUTPUT
+          # Write to files so the next step can read them safely
+          echo "$REVIEW"     > /tmp/groq_review.txt
+          echo "$MODEL_USED" > /tmp/groq_model.txt
 
           echo "──── Groq Review ($MODEL_USED) ────"
           echo "$REVIEW"
