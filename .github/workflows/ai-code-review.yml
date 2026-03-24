@@ -14,10 +14,8 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   claude-review:
     name: Claude AI Review
+    if: false   # disabled — Groq only for now
     runs-on: ubuntu-latest
-    # Skip this job gracefully if the Anthropic key is not configured.
-    # The job is still created so the workflow doesn't show as "failed".
-    if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
 
     permissions:
       contents: read
@@ -151,8 +149,8 @@ jobs:
   groq-review:
     name: Groq AI Review
     runs-on: ubuntu-latest
-    # Skip gracefully if the Groq key is not configured.
-    if: ${{ secrets.GROQ_API_KEY != '' }}
+    # NOTE: do NOT use "if: secrets.X != ''" at job level — secrets context
+    # is not available in job-level conditions. Key is checked inside the step.
 
     permissions:
       contents: read
@@ -170,16 +168,18 @@ jobs:
       - name: Install jq
         run: sudo apt-get install -y jq
 
-      # ── 3. Compute the unified diff of the PR ────────────────────────────
+      # ── 3. Compute the unified diff (Java files only) ────────────────────
       - name: Get PR diff
         id: diff
         run: |
           git diff \
             ${{ github.event.pull_request.base.sha }} \
             ${{ github.event.pull_request.head.sha }} \
+            -- '*.java' \
             > /tmp/pr_diff.txt
 
           echo "Diff size: $(wc -c < /tmp/pr_diff.txt) bytes"
+          cat /tmp/pr_diff.txt
 
       # ── 4. Call Groq API ──────────────────────────────────────────────────
       # Model: llama-3.3-70b-versatile (best free Groq model for code review)
