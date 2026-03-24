@@ -37,6 +37,7 @@ jobs:
   # ── Claude AI Review ────────────────────────────────────────────────────────
   claude-review:
     name: Claude AI Review
+    if: false   # disabled — Groq only for now
     runs-on: ubuntu-latest
     permissions:
       contents: read
